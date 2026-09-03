@@ -35,11 +35,16 @@ ollama pull qwen3.5:4b
 
 System packages already expected on this Jetson image: `librealsense2`, OpenCV, NumPy, Ollama.
 
-Python RealSense bindings (match the installed SDK):
+Python RealSense bindings into a local virtual environment (to avoid PEP 668 issues with system Python):
 
 ```bash
-python3 -m pip install --user --break-system-packages -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+If you already created `.venv`, just run `source .venv/bin/activate`.
 
 Optional speech:
 
@@ -50,7 +55,8 @@ sudo apt install espeak
 ## Run
 
 ```bash
-python3 demo.py
+source .venv/bin/activate
+python demo.py
 ```
 
 Press `q` or Esc to quit. Ctrl+C also works.
@@ -58,9 +64,9 @@ Press `q` or Esc to quit. Ctrl+C also works.
 Useful variants:
 
 ```bash
-python3 demo.py --speech          # speak each caption with espeak
-python3 demo.py --headless        # captions only, no OpenCV window
-python3 demo.py --composite       # send RGB|depth to the model, not just RGB
+python demo.py --speech          # speak each caption with espeak
+python demo.py --headless        # captions only, no OpenCV window
+python demo.py --composite       # send RGB|depth to the model, not just RGB
 ```
 
 The window shows RGB | colorized depth, range stats above the images, and the live caption below.
@@ -102,5 +108,5 @@ All values are meters, from valid depth pixels (0.15–20 m):
 
 ```
 demo.py              live capture + Ollama loop
-requirements.txt     pyrealsense2 pin (2.58.3)
+requirements.txt     pyrealsense2 pin (2.58.4)
 ```
