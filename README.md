@@ -1,33 +1,36 @@
 # RGB-D VLM demo
 
-Live captions from a RealSense stereo depth camera and a local Ollama Qwen vision model. The loop reads aligned RGB + depth, asks the model to name the scene in **8 words or less**, and updates a window (and optional speech) as fast as the model can go.
+Live captions from a RealSense stereo depth camera on Jetson. Two backends:
 
-On a Jetson AGX Thor with a D457 and `qwen3.5:4b`, captions typically land around **1 second** after the model is warm.
+| Demo | Backend | Warm latency (Thor) | Best for |
+| --- | --- | --- | --- |
+| `demo.py` | Ollama + `qwen3.5:4b` (JPEG over HTTP) | ~280–350 ms | Richer language / depth in the prompt |
+| `demo_cuda.py` | In-process CUDA **BLIP** | ~70–110 ms | Lowest latency |
+
+Both show RGB | colorized depth, range stats, and an **≤8 word** caption (optional speech).
 
 ## What you need
 
-- Intel RealSense D400-series camera (developed on a **D457** over GMSL; USB D400 units should work too)
-- [librealsense](https://github.com/realsenseai/librealsense) 2.58.x
+- Intel RealSense D400-series camera (developed on a **D457** over GMSL; USB D400 units work too)
+- [librealsense](https://github.com/realsenseai/librealsense) 2.58.x built with **CUDA + zero-copy** (see Install)
 - Python 3.12 with OpenCV and NumPy
-- [Ollama](https://ollama.com) serving a vision-capable Qwen model
+- **Ollama demo:** [Ollama](https://ollama.com) with a vision model (default `qwen3.5:4b`)
+- **CUDA demo:** Jetson CUDA PyTorch + transformers (`requirements-cuda.txt`)
 - Optional: `espeak` for spoken captions
 
-Confirm the camera is visible:
+Confirm the camera is visible and free (nothing holding `/dev/video*`):
 
 ```bash
 rs-enumerate-devices -s
+fuser /dev/video0 2>&1   # should print nothing
 ```
 
-Confirm Ollama has a vision model (this repo defaults to `qwen3.5:4b`):
+### Ollama model (for `demo.py` only)
 
 ```bash
 ollama list
 curl -s http://127.0.0.1:11434/api/tags
-```
-
-If the model is missing:
-
-```bash
+# if missing:
 ollama pull qwen3.5:4b
 ```
 
@@ -52,17 +55,14 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ./scripts/use_zerocopy_pyrealsense.sh   # link /usr/local pyrealsense2 into .venv
-```
-
-If `.venv` already exists:
-
-```bash
-source .venv/bin/activate
-./scripts/use_zerocopy_pyrealsense.sh
 python test_zerocopy.py                 # expect ZERO-COPY / PASS
 ```
 
-Confirm the camera is free (no `ros2` `realsense2_camera` holding `/dev/video*`).
+For the faster CUDA caption demo, also install Jetson CUDA torch (SBSA / CUDA 13.x index):
+
+```bash
+pip install -r requirements-cuda.txt
+```
 
 Optional speech:
 
@@ -74,56 +74,92 @@ sudo apt install espeak
 
 ```bash
 source .venv/bin/activate
-python demo.py
 ```
 
-On start, the demo prints `cuda frame path: ZERO-COPY (...)` when the CUDA zero-copy
-build is active. The VLM path still JPEG-encodes on the CPU today; `test_zerocopy.py`
-is the direct GPU-pointer check.
+### Ollama / Qwen (`demo.py`)
+
+```bash
+python demo.py
+python demo.py --speech
+python demo.py --headless
+python demo.py --composite       # send RGB|depth image to the model
+```
+
+Prints `cuda frame path: ZERO-COPY (...)` when the zero-copy SDK build is active.
+Uses a CPU JPEG + Ollama HTTP; depth distances are embedded in the text prompt.
+
+### CUDA BLIP (`demo_cuda.py`) — faster
+
+In-process GPU captioning — **no JPEG, no Ollama**. First run downloads
+`Salesforce/blip-image-captioning-base` into `.hf_cache/`.
+
+```bash
+python demo_cuda.py
+python demo_cuda.py --headless
+python demo_cuda.py --speech
+```
+
+Captions are shorter / less “chatty” than Qwen; pick this when latency matters more
+than LLM reasoning.
 
 Press `q` or Esc to quit. Ctrl+C also works.
 
-Useful variants:
-
-```bash
-python demo.py --speech          # speak each caption with espeak
-python demo.py --headless        # captions only, no OpenCV window
-python demo.py --composite       # send RGB|depth to the model, not just RGB
-```
-
-The window shows RGB | colorized depth, range stats above the images, and the live caption below.
-
-A `Gtk-Message: Failed to load module "canberra-gtk-module"` line is harmless (OpenCV’s GTK window looking for click sounds). Ignore it, or install `libcanberra-gtk-module` to silence it.
+A `Gtk-Message: Failed to load module "canberra-gtk-module"` line is harmless
+(OpenCV’s GTK window). Ignore it, or install `libcanberra-gtk-module` to silence it.
 
 ## Options
+
+### Shared
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--width` / `--height` / `--fps` | `640` / `360` / `30` | Camera streams |
+| `--headless` | off | No GUI |
+| `--speech` | off | Speak each caption with espeak |
+| `--espeak` | `espeak` | Path to the espeak binary |
+
+### `demo.py` (Ollama)
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--model` | `qwen3.5:4b` (or `$OLLAMA_MODEL`) | Ollama vision model |
 | `--host` | `http://127.0.0.1:11434` (or `$OLLAMA_HOST`) | Ollama base URL |
-| `--width` / `--height` / `--fps` | `640` / `360` / `30` | Camera streams |
-| `--vlm-width` | `256` | JPEG width sent to the VLM (vision-token bound) |
+| `--vlm-width` | `256` | JPEG width sent to the VLM |
 | `--jpeg-quality` | `65` | JPEG quality |
 | `--composite` | off | Also show colorized depth to the VLM |
-| `--headless` | off | No GUI |
-| `--speech` | off | Speak each caption with espeak |
-| `--espeak` | `espeak` | Path to the espeak binary |
 | `--num-predict` | `20` | Max tokens from the model |
 | `--num-ctx` | `512` | Context window |
 
+### `demo_cuda.py` (CUDA BLIP)
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--model` | `Salesforce/blip-image-captioning-base` | Hugging Face BLIP id |
+| `--vlm-width` | `384` | RGB width fed to BLIP |
+| `--max-new-tokens` | `12` | Max generated tokens |
+| `--hf-home` | `.hf_cache/` | Model download cache |
+
 ## How it stays fast
 
-- A capture thread always keeps the latest aligned RGB-D frame **and** a
-  pre-baked VLM JPEG; inference never waits on resize/encode or a stale buffer.
-- JPEG stays on the **CPU** (OpenCV / libjpeg-turbo, ~1 ms). GPU JPEG (nvJPEG)
-  was measured not to help: Ollama already owns the GPU for vision tokens, and
-  CPU encode overlaps with the previous request on the capture thread.
-- Default `--vlm-width 256` cuts vision tokens vs 320 with little quality loss
-  on `qwen3.5:4b` (Thor). Depth is passed as meters in the prompt (`near`,
-  `mid`, `L/C/R`) so the model gets RGB-D without extra vision tokens.
-  `--composite` is the slower “see the depth image” path.
-- Thinking is disabled (`think: false`) so Qwen 3.5 does not spend the token budget on a reasoning trace.
-- The model is kept loaded (`keep_alive` 24h). First caption after a cold start is slower.
+**Ollama path (`demo.py`)**
+
+- Capture thread keeps the latest aligned RGB-D frame and a pre-baked VLM JPEG.
+- JPEG stays on the CPU (~1 ms). GPU JPEG does not help: Ollama owns the GPU for
+  vision tokens.
+- Default `--vlm-width 256` limits vision tokens. Depth is meters in the prompt
+  (`near` / `mid` / `L/C/R`); `--composite` is slower.
+- `think: false`, `keep_alive` 24h. First caption after a cold start is slower.
+
+**CUDA path (`demo_cuda.py`)**
+
+- Same RealSense capture / HUD; inference is BLIP `float16` on the Jetson GPU.
+- No JPEG/HTTP round-trip — RGB goes straight into the model.
+- On Thor, warm captions land around **70–110 ms** (vs ~300 ms for Ollama Qwen).
+
+**Zero-copy**
+
+- Requires `-DBUILD_WITH_CUDA_ZEROCOPY=ON` and `./scripts/use_zerocopy_pyrealsense.sh`.
+- Verify with `python test_zerocopy.py`.
 
 ## HUD distances
 
@@ -136,9 +172,11 @@ All values are meters, from valid depth pixels (0.15–20 m):
 ## Layout
 
 ```
-demo.py                              live capture + Ollama loop
+demo.py                              Ollama / Qwen live captions
+demo_cuda.py                         CUDA BLIP live captions (faster)
 test_zerocopy.py                     CUDA zero-copy smoke test
 requirements.txt                     numpy / opencv (pyrealsense2 via script)
+requirements-cuda.txt                Jetson CUDA torch + transformers for demo_cuda
 scripts/use_zerocopy_pyrealsense.sh  link /usr/local CUDA bindings into .venv
 scripts/rs_zerocopy_env.sh           LD_LIBRARY_PATH helper
 ```

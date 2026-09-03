@@ -1,0 +1,16 @@
+# CUDA VLM backend for demo_cuda.py (Jetson Thor / SBSA + CUDA 13.x).
+# Install AFTER requirements.txt + scripts/use_zerocopy_pyrealsense.sh:
+#
+#   pip install -r requirements-cuda.txt
+#
+# torch/torchvision must come from the Jetson AI Lab index (not stock PyPI).
+
+--extra-index-url https://pypi.jetson-ai-lab.io/sbsa/cu132
+torch==2.14.0
+torchvision==0.29.0
+transformers>=4.45.0
+accelerate>=0.33.0
+pillow>=10.0.0
+sentencepiece>=0.2.0
+protobuf>=4.0.0
+einops>=0.7.0
