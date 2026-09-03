@@ -5,6 +5,12 @@ Designed for a Jetson + D457 (or any D400 RGB-D camera) and the local
 qwen3.5:4b vision model. Capture, JPEG encode, and inference overlap so
 the on-screen label always uses the newest frame.
 
+JPEG stays on the CPU (libjpeg-turbo via OpenCV, ~0.5–1 ms at VLM size).
+Moving encode to the GPU (nvJPEG) does not speed captions: Ollama owns the
+GPU for vision tokens, and CPU encode overlaps with the previous request on
+the capture thread. Faster captions come from a smaller VLM JPEG (fewer
+vision tokens), not from GPU JPEG.
+
     python3 demo.py
     python3 demo.py --headless
     python3 demo.py --speech
@@ -63,6 +69,9 @@ class FrameBundle:
     depth_vis: np.ndarray
     stats: DepthStats
     ts: float
+    # Pre-baked RGB JPEG for Ollama (built on the capture thread). None when
+    # --composite needs a runtime RGB|depth stitch before encode.
+    vlm_jpeg: Optional[bytes] = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,7 +81,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=360)
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--vlm-width", type=int, default=320, help="JPEG width sent to the VLM")
+    # 256 is the sweet spot measured on Thor + qwen3.5:4b: fewer vision tokens
+    # than 320 with nearly the same caption quality; 160 barely helps further.
+    p.add_argument("--vlm-width", type=int, default=256, help="JPEG width sent to the VLM")
     p.add_argument("--jpeg-quality", type=int, default=65)
     p.add_argument("--composite", action="store_true", help="Send RGB|depth image instead of RGB only")
     p.add_argument("--headless", action="store_true", help="Print captions only, no OpenCV window")
@@ -151,11 +162,38 @@ def encode_jpeg(bgr: np.ndarray, width: int, quality: int) -> bytes:
     return buf.tobytes()
 
 
+def probe_zerocopy(color_frame: rs.video_frame) -> str:
+    """Return a short ZERO-COPY / UPLOAD / NONE / n/a label for a color frame."""
+    if not hasattr(rs, "gpu_frame") or not hasattr(color_frame, "get_gpu_data_or_upload"):
+        return "n/a (no gpu_frame API — install CUDA zero-copy pyrealsense2)"
+    gf = color_frame.as_gpu_frame()
+    res = color_frame.get_gpu_data_or_upload()
+    if res is None:
+        return "NONE (non-CUDA build)"
+    _addr, copied = res
+    if gf and not copied:
+        return "ZERO-COPY (gpu_frame device pointer aliases frame)"
+    return "UPLOAD (SDK host→device copy)"
+
+
 class RealSenseGrabber:
-    def __init__(self, width: int, height: int, fps: int) -> None:
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: int,
+        vlm_width: int = 256,
+        jpeg_quality: int = 65,
+        preencode_jpeg: bool = True,
+    ) -> None:
         self.width = width
         self.height = height
         self.fps = fps
+        self.vlm_width = vlm_width
+        self.jpeg_quality = jpeg_quality
+        # Pre-encode on this thread so the VLM loop never waits on resize/JPEG;
+        # leaves the GPU free for Ollama (CPU encode is ~1 ms).
+        self.preencode_jpeg = preencode_jpeg
         self._pipe = rs.pipeline()
         self._align = rs.align(rs.stream.color)
         self._lock = threading.Lock()
@@ -164,6 +202,7 @@ class RealSenseGrabber:
         self._thread: Optional[threading.Thread] = None
         self._depth_scale = 0.001
         self.fps_cam = 0.0
+        self.zerocopy_path = "unknown"
 
     def start(self) -> None:
         cfg = rs.config()
@@ -174,6 +213,8 @@ class RealSenseGrabber:
         print(f"camera: {device.get_info(rs.camera_info.name)}  "
               f"{device.get_info(rs.camera_info.serial_number)}  "
               f"{self.width}x{self.height}@{self.fps}", flush=True)
+        print(f"pyrealsense2: {getattr(rs, '__file__', '?')}  "
+              f"v{getattr(rs, '__version__', '?')}", flush=True)
         try:
             self._depth_scale = profile.get_device().first_depth_sensor().get_depth_scale()
         except Exception:
@@ -182,8 +223,13 @@ class RealSenseGrabber:
             if sensor.supports(rs.option.frames_queue_size):
                 sensor.set_option(rs.option.frames_queue_size, 1)
         # Prime a few frames so auto-exposure settles before the first JPEG.
+        color = None
         for _ in range(8):
-            self._pipe.wait_for_frames(5000)
+            frames = self._pipe.wait_for_frames(5000)
+            color = frames.get_color_frame()
+        if color:
+            self.zerocopy_path = probe_zerocopy(color)
+        print(f"cuda frame path: {self.zerocopy_path}", flush=True)
         self._thread = threading.Thread(target=self._loop, name="realsense", daemon=True)
         self._thread.start()
 
@@ -206,7 +252,15 @@ class RealSenseGrabber:
             depth_m = depth_raw.astype(np.float32) * self._depth_scale
             # 0.03 is the usual D400 display scale (~max 8 m → 255).
             depth_vis = cv2.applyColorMap(cv2.convertScaleAbs(depth_raw, alpha=0.03), cv2.COLORMAP_TURBO)
-            bundle = FrameBundle(color.copy(), depth_vis, depth_stats(depth_m), time.time())
+            stats = depth_stats(depth_m)
+            # Encode while this thread owns `color` (before the display copy) so
+            # the infer loop only pays for Ollama HTTP round-trips.
+            vlm_jpeg = (
+                encode_jpeg(color, self.vlm_width, self.jpeg_quality)
+                if self.preencode_jpeg
+                else None
+            )
+            bundle = FrameBundle(color.copy(), depth_vis, stats, time.time(), vlm_jpeg)
             with self._lock:
                 self._latest = bundle
             now = time.perf_counter()
@@ -346,12 +400,19 @@ def infer_loop(
             time.sleep(0.01)
             continue
         if args.composite:
-            rgb = cv2.resize(bundle.color_bgr, (args.vlm_width, int(args.vlm_width * bundle.color_bgr.shape[0] / bundle.color_bgr.shape[1])))
+            rgb = cv2.resize(
+                bundle.color_bgr,
+                (args.vlm_width, int(args.vlm_width * bundle.color_bgr.shape[0] / bundle.color_bgr.shape[1])),
+            )
             dep = cv2.resize(bundle.depth_vis, (rgb.shape[1], rgb.shape[0]))
             frame = np.hstack((rgb, dep))
-            prompt = PROMPT_COMPOSITE.format(near=bundle.stats.near_m, med=bundle.stats.median_m) if bundle.stats.valid else PROMPT_NO_DEPTH
+            prompt = (
+                PROMPT_COMPOSITE.format(near=bundle.stats.near_m, med=bundle.stats.median_m)
+                if bundle.stats.valid
+                else PROMPT_NO_DEPTH
+            )
+            jpeg = encode_jpeg(frame, frame.shape[1], args.jpeg_quality)
         else:
-            frame = bundle.color_bgr
             prompt = (
                 PROMPT.format(
                     near=bundle.stats.near_m,
@@ -363,12 +424,13 @@ def infer_loop(
                 if bundle.stats.valid
                 else PROMPT_NO_DEPTH
             )
+            jpeg = bundle.vlm_jpeg or encode_jpeg(bundle.color_bgr, args.vlm_width, args.jpeg_quality)
+
         def on_token(text: str) -> None:
             with state.lock:
                 state.caption = clamp_words(text) or "…"
 
         try:
-            jpeg = encode_jpeg(frame, args.vlm_width if not args.composite else frame.shape[1], args.jpeg_quality)
             t0 = time.perf_counter()
             raw, _metrics = captioner.caption(jpeg, prompt, on_token=on_token)
             dt = time.perf_counter() - t0
@@ -454,7 +516,14 @@ def main() -> int:
             return 1
         print(f"speech: {args.espeak}  (each caption)", flush=True)
 
-    grabber = RealSenseGrabber(args.width, args.height, args.fps)
+    grabber = RealSenseGrabber(
+        args.width,
+        args.height,
+        args.fps,
+        vlm_width=args.vlm_width,
+        jpeg_quality=args.jpeg_quality,
+        preencode_jpeg=not args.composite,
+    )
     captioner = OllamaCaptioner(args.host, args.model, args.num_predict, args.num_ctx)
     try:
         grabber.start()

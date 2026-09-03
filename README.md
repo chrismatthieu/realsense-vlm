@@ -33,18 +33,36 @@ ollama pull qwen3.5:4b
 
 ## Install
 
-System packages already expected on this Jetson image: `librealsense2`, OpenCV, NumPy, Ollama.
+System packages already expected on this Jetson image: OpenCV, NumPy, Ollama.
 
-Python RealSense bindings into a local virtual environment (to avoid PEP 668 issues with system Python):
+**RealSense must be the local CUDA + zero-copy build** (not the PyPI wheel). Build
+[librealsense](https://github.com/realsenseai/librealsense) with:
+
+```bash
+-DBUILD_WITH_CUDA=ON -DBUILD_WITH_CUDA_ZEROCOPY=ON -DBUILD_PYTHON_BINDINGS=ON
+```
+
+and `sudo make install` so `/usr/local` has `librealsense2` + `pyrealsense2`.
+
+Python deps into a local virtual environment (avoids PEP 668 with system Python):
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+./scripts/use_zerocopy_pyrealsense.sh   # link /usr/local pyrealsense2 into .venv
 ```
 
-If you already created `.venv`, just run `source .venv/bin/activate`.
+If `.venv` already exists:
+
+```bash
+source .venv/bin/activate
+./scripts/use_zerocopy_pyrealsense.sh
+python test_zerocopy.py                 # expect ZERO-COPY / PASS
+```
+
+Confirm the camera is free (no `ros2` `realsense2_camera` holding `/dev/video*`).
 
 Optional speech:
 
@@ -58,6 +76,10 @@ sudo apt install espeak
 source .venv/bin/activate
 python demo.py
 ```
+
+On start, the demo prints `cuda frame path: ZERO-COPY (...)` when the CUDA zero-copy
+build is active. The VLM path still JPEG-encodes on the CPU today; `test_zerocopy.py`
+is the direct GPU-pointer check.
 
 Press `q` or Esc to quit. Ctrl+C also works.
 
@@ -80,7 +102,7 @@ A `Gtk-Message: Failed to load module "canberra-gtk-module"` line is harmless (O
 | `--model` | `qwen3.5:4b` (or `$OLLAMA_MODEL`) | Ollama vision model |
 | `--host` | `http://127.0.0.1:11434` (or `$OLLAMA_HOST`) | Ollama base URL |
 | `--width` / `--height` / `--fps` | `640` / `360` / `30` | Camera streams |
-| `--vlm-width` | `320` | JPEG width sent to the VLM |
+| `--vlm-width` | `256` | JPEG width sent to the VLM (vision-token bound) |
 | `--jpeg-quality` | `65` | JPEG quality |
 | `--composite` | off | Also show colorized depth to the VLM |
 | `--headless` | off | No GUI |
@@ -91,8 +113,15 @@ A `Gtk-Message: Failed to load module "canberra-gtk-module"` line is harmless (O
 
 ## How it stays fast
 
-- A capture thread always keeps the latest aligned RGB-D frame; inference never waits on a stale buffer.
-- The VLM sees a small JPEG. Depth is passed as meters in the prompt (`near`, `mid`, `L/C/R`) so the model gets RGB-D without extra vision tokens. `--composite` is the slower “see the depth image” path.
+- A capture thread always keeps the latest aligned RGB-D frame **and** a
+  pre-baked VLM JPEG; inference never waits on resize/encode or a stale buffer.
+- JPEG stays on the **CPU** (OpenCV / libjpeg-turbo, ~1 ms). GPU JPEG (nvJPEG)
+  was measured not to help: Ollama already owns the GPU for vision tokens, and
+  CPU encode overlaps with the previous request on the capture thread.
+- Default `--vlm-width 256` cuts vision tokens vs 320 with little quality loss
+  on `qwen3.5:4b` (Thor). Depth is passed as meters in the prompt (`near`,
+  `mid`, `L/C/R`) so the model gets RGB-D without extra vision tokens.
+  `--composite` is the slower “see the depth image” path.
 - Thinking is disabled (`think: false`) so Qwen 3.5 does not spend the token budget on a reasoning trace.
 - The model is kept loaded (`keep_alive` 24h). First caption after a cold start is slower.
 
@@ -107,6 +136,9 @@ All values are meters, from valid depth pixels (0.15–20 m):
 ## Layout
 
 ```
-demo.py              live capture + Ollama loop
-requirements.txt     pyrealsense2 pin (2.58.4)
+demo.py                              live capture + Ollama loop
+test_zerocopy.py                     CUDA zero-copy smoke test
+requirements.txt                     numpy / opencv (pyrealsense2 via script)
+scripts/use_zerocopy_pyrealsense.sh  link /usr/local CUDA bindings into .venv
+scripts/rs_zerocopy_env.sh           LD_LIBRARY_PATH helper
 ```

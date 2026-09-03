@@ -1,3 +1,5 @@
-pyrealsense2==2.58.4.10922
+# OpenCV / NumPy from pip. pyrealsense2 must NOT come from PyPI for CUDA zero-copy —
+# wire the /usr/local CUDA+ZEROCOPY build into the venv instead:
+#   ./scripts/use_zerocopy_pyrealsense.sh
 numpy==2.5.2
 opencv-python==5.0.0.93
